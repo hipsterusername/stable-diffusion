@@ -8,7 +8,7 @@ hide:
 
 ## **Interactive Command Line Interface**
 
-The `invoke.py` script, located in `scripts/dream.py`, provides an interactive
+The `invoke.py` script, located in `scripts/`, provides an interactive
 interface to image generation similar to the "invoke mothership" bot that Stable
 AI provided on its Discord server.
 
@@ -86,6 +86,7 @@ overridden on a per-prompt basis (see [List of prompt arguments](#list-of-prompt
 | `--model <modelname>`                     |                                           | `stable-diffusion-1.4`                         | Loads model specified in configs/models.yaml. Currently one of "stable-diffusion-1.4" or "laion400m" |
 | `--full_precision`                        | `-F`                                      | `False`                                        | Run in slower full-precision mode. Needed for Macintosh M1/M2 hardware and some older video cards.   |
 | `--png_compression <0-9>`                 | `-z<0-9>`                                 |  6                                             | Select level of compression for output files, from 0 (no compression) to 9 (max compression)         |
+| `--safety-checker`                        |                                           |  False                                         | Activate safety checker for NSFW and other potentially disturbing imagery                            |
 | `--web`                                   |                                           | `False`                                        | Start in web server mode                                                                             |
 | `--host <ip addr>`                        |                                           | `localhost`                                    | Which network interface web server should listen on. Set to 0.0.0.0 to listen on any.                |
 | `--port <port>`                           |                                           | `9090`                                         | Which port web server should listen for requests on.                                                 |
@@ -97,7 +98,6 @@ overridden on a per-prompt basis (see [List of prompt arguments](#list-of-prompt
 | `--embedding_path <path>`                 |                                           | `None`                                         | Path to pre-trained embedding manager checkpoints, for custom models                                 |
 | `--gfpgan_dir`                            |                                           | `src/gfpgan`                                   | Path to where GFPGAN is installed.                                                                   |
 | `--gfpgan_model_path`                     |                                           | `experiments/pretrained_models/GFPGANv1.4.pth` | Path to GFPGAN model file, relative to `--gfpgan_dir`.                                               |
-| `--device <device>`                       | `-d<device>`                              | `torch.cuda.current_device()`                  | Device to run SD on, e.g. "cuda:0"                                                                   |
 | `--free_gpu_mem`                          |                                           | `False`                                        | Free GPU memory after sampling, to allow image decoding and saving in low VRAM conditions            |
 | `--precision`                             |                                           | `auto`                                         | Set model precision, default is selected by device. Options: auto, float32, float16, autocast        |
 
@@ -153,6 +153,7 @@ Here are the invoke> command that apply to txt2img:
 | --cfg_scale <float>| -C<float> | 7.5                 | How hard to try to match the prompt to the generated image; any number greater than 1.0 works, but the useful range is roughly 5.0 to 20.0 |
 | --seed <int>       | -S<int>   | None                | Set the random seed for the next series of images. This can be used to recreate an image generated previously.|
 | --sampler <sampler>| -A<sampler>| k_lms              | Sampler to use. Use -h to get list of available samplers. |
+| --karras_max <int> |           | 29                  | When using k_* samplers, set the maximum number of steps before shifting from using the Karras noise schedule (good for low step counts) to the LatentDiffusion noise schedule (good for high step counts) This value is sticky. [29] |
 | --hires_fix        |           |                     | Larger images often have duplication artefacts. This option suppresses duplicates by generating the image at low res, and then using img2img to increase the resolution |
 | --png_compression <0-9> | -z<0-9> |  6           | Select level of compression for output files, from 0 (no compression) to 9 (max compression)         |
 | --grid             | -g        | False               | Turn on grid mode to return a single image combining all the images generated by this prompt |
@@ -218,7 +219,12 @@ well as the --mask (-M) and --text_mask (-tm) arguments:
 | Argument <img width="100" align="right"/> |  Shortcut  |  Default            |  Description |
 |--------------------|------------|---------------------|--------------|
 | `--init_mask <path>` | `-M<path>`   | `None`                |Path to an image the same size as the initial_image, with areas for inpainting made transparent.|
+| `--invert_mask   ` |                | False                 |If true, invert the mask so that transparent areas are opaque and vice versa.|
 | `--text_mask <prompt> [<float>]` | `-tm <prompt> [<float>]` | <none>  | Create a mask from a text prompt describing part of the image|
+
+The mask may either be an image with transparent areas, in which case
+the inpainting will occur in the transparent areas only, or a black
+and white image, in which case all black areas will be painted into.
 
 `--text_mask` (short form `-tm`) is a way to generate a mask using a
 text description of the part of the image to replace. For example, if

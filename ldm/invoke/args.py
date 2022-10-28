@@ -83,16 +83,16 @@ with metadata_from_png():
 import argparse
 from argparse import Namespace, RawTextHelpFormatter
 import pydoc
-import shlex
 import json
 import hashlib
 import os
 import re
+import shlex
 import copy
 import base64
 import functools
 import ldm.invoke.pngwriter
-from ldm.invoke.conditioning import split_weighted_subprompts
+from ldm.invoke.prompt_parser import split_weighted_subprompts
 
 SAMPLER_CHOICES = [
     'ddim',
@@ -113,8 +113,8 @@ PRECISION_CHOICES = [
 ]
 
 # is there a way to pick this up during git commits?
-APP_ID      = 'lstein/stable-diffusion'
-APP_VERSION = 'v1.15'
+APP_ID      = 'invoke-ai/InvokeAI'
+APP_VERSION = 'v2.02'
 
 class ArgFormatter(argparse.RawTextHelpFormatter):
         # use defined argument order to display usage
@@ -169,27 +169,31 @@ class Args(object):
 
     def parse_cmd(self,cmd_string):
         '''Parse a invoke>-style command string '''
-        command = cmd_string.replace("'", "\\'")
-        try:
-            elements = shlex.split(command)
-        except ValueError:
-            import sys, traceback
-            print(traceback.format_exc(), file=sys.stderr)
-            return
-        switches = ['']
-        switches_started = False
-
-        for element in elements:
-            if element[0] == '-' and not switches_started:
-                switches_started = True
-            if switches_started:
-                switches.append(element)
+        # handle the case in which the first token is a switch
+        if cmd_string.startswith('-'):
+            prompt = ''
+            switches = cmd_string
+        # handle the case in which the prompt is enclosed by quotes
+        elif cmd_string.startswith('"'):
+            a = shlex.split(cmd_string)
+            prompt = a[0]
+            switches = shlex.join(a[1:])
+        else:
+            # no initial quote, so get everything up to the first thing
+            # that looks like a switch
+            if cmd_string.startswith('-'):
+                prompt = ''
+                switches = cmd_string
             else:
-                switches[0] += element
-                switches[0] += ' '
-        switches[0] = switches[0][: len(switches[0]) - 1]
+                match = re.match('^(.+?)\s(--?[a-zA-Z].+)',cmd_string)
+                if match:
+                    prompt,switches = match.groups()
+                else:
+                    prompt = cmd_string
+                    switches = ''
         try:
-            self._cmd_switches = self._cmd_parser.parse_args(switches)
+            self._cmd_switches = self._cmd_parser.parse_args(shlex.split(switches))
+            setattr(self._cmd_switches,'prompt',prompt)
             return self._cmd_switches
         except:
             return None
@@ -210,12 +214,16 @@ class Args(object):
         a = vars(self)
         a.update(kwargs)
         switches = list()
-        switches.append(f'"{a["prompt"]}"')
+        prompt = a['prompt']
+        prompt.replace('"','\\"')
+        switches.append(prompt)
         switches.append(f'-s {a["steps"]}')
         switches.append(f'-S {a["seed"]}')
         switches.append(f'-W {a["width"]}')
         switches.append(f'-H {a["height"]}')
         switches.append(f'-C {a["cfg_scale"]}')
+        if a['karras_max'] is not None:
+            switches.append(f'--karras_max {a["karras_max"]}')
         if a['perlin'] > 0:
             switches.append(f'--perlin {a["perlin"]}')
         if a['threshold'] > 0:
@@ -241,6 +249,8 @@ class Args(object):
                 switches.append(f'-f {a["strength"]}')
             if a['inpaint_replace']:
                 switches.append(f'--inpaint_replace')
+            if a['text_mask']:
+                switches.append(f'-tm {" ".join([str(u) for u in a["text_mask"]])}')
         else:
             switches.append(f'-A {a["sampler_name"]}')
 
@@ -418,6 +428,11 @@ class Args(object):
             help=f'Set model precision. Defaults to auto selected based on device. Options: {", ".join(PRECISION_CHOICES)}',
             default='auto',
         )
+        model_group.add_argument(
+            '--safety_checker',
+            action='store_true',
+            help='Check for and blur potentially NSFW images',
+        )
         file_group.add_argument(
             '--from_file',
             dest='infile',
@@ -436,6 +451,12 @@ class Args(object):
             '-p',
             action='store_true',
             help='Place images in subdirectories named after the prompt.',
+        )
+        render_group.add_argument(
+            '--fnformat',
+            default='{prefix}.{seed}.png',
+            type=str,
+            help='Overwrite the filename format. You can use any argument as wildcard enclosed in curly braces. Default is {prefix}.{seed}.png',
         )
         render_group.add_argument(
             '--grid',
@@ -554,10 +575,17 @@ class Args(object):
         )
         render_group     = parser.add_argument_group('General rendering')
         img2img_group    = parser.add_argument_group('Image-to-image and inpainting')
+        inpainting_group    = parser.add_argument_group('Inpainting')
+        outpainting_group    = parser.add_argument_group('Outpainting and outcropping')
         variation_group  = parser.add_argument_group('Creating and combining variations')
         postprocessing_group   = parser.add_argument_group('Post-processing')
         special_effects_group  = parser.add_argument_group('Special effects')
-        render_group.add_argument('prompt')
+        deprecated_group = parser.add_argument_group('Deprecated options')
+        render_group.add_argument(
+            '--prompt',
+            default='',
+            help='prompt string',
+        )
         render_group.add_argument(
             '-s',
             '--steps',
@@ -609,6 +637,12 @@ class Args(object):
             default=0.0,
             type=float,
             help='Perlin noise scale (0.0 - 1.0) - add perlin noise to the initialization instead of the usual gaussian noise.',
+        )
+        render_group.add_argument(
+            '--fnformat',
+            default='{prefix}.{seed}.png',
+            type=str,
+            help='Overwrite the filename format. You can use any argument as wildcard enclosed in curly braces. Default is {prefix}.{seed}.png',
         )
         render_group.add_argument(
             '--grid',
@@ -669,19 +703,19 @@ class Args(object):
             default=6,
             choices=range(0,10),
             dest='png_compression',
-            help='level of PNG compression, from 0 (none) to 9 (maximum). Default is 6.'
+            help='level of PNG compression, from 0 (none) to 9 (maximum). [6]'
+        )
+        render_group.add_argument(
+            '--karras_max',
+            type=int,
+            default=None,
+            help="control the point at which the K* samplers will shift from using the Karras noise schedule (good for low step counts) to the LatentDiffusion noise schedule (good for high step counts). Set to 0 to use LatentDiffusion for all step values, and to a high value (e.g. 1000) to use Karras for all step values. [29]."
         )
         img2img_group.add_argument(
             '-I',
             '--init_img',
             type=str,
             help='Path to input image for img2img mode (supersedes width and height)',
-        )
-        img2img_group.add_argument(
-            '-M',
-            '--init_mask',
-            type=str,
-            help='Path to input mask for inpainting mode (supersedes width and height)',
         )
         img2img_group.add_argument(
             '-tm',
@@ -710,28 +744,67 @@ class Args(object):
             help='Strength for noising/unnoising. 0.0 preserves image exactly, 1.0 replaces it completely',
             default=0.75,
         )
-        img2img_group.add_argument(
-            '-D',
-            '--out_direction',
-            nargs='+',
+        inpainting_group.add_argument(
+            '-M',
+            '--init_mask',
             type=str,
-            metavar=('direction', 'pixels'),
-            help='Direction to extend the given image (left|right|top|bottom). If a distance pixel value is not specified it defaults to half the image size'
+            help='Path to input mask for inpainting mode (supersedes width and height)',
         )
-        img2img_group.add_argument(
-            '-c',
-            '--outcrop',
-            nargs='+',
-            type=str,
-            metavar=('direction','pixels'),
-            help='Outcrop the image with one or more direction/pixel pairs: -c top 64 bottom 128 left 64 right 64',
+        inpainting_group.add_argument(
+            '--invert_mask',
+            action='store_true',
+            help='Invert the mask',
         )
-        img2img_group.add_argument(
+        inpainting_group.add_argument(
             '-r',
             '--inpaint_replace',
             type=float,
             default=0.0,
             help='when inpainting, adjust how aggressively to replace the part of the picture under the mask, from 0.0 (a gentle merge) to 1.0 (replace entirely)',
+        )
+        outpainting_group.add_argument(
+            '-c',
+            '--outcrop',
+            nargs='+',
+            type=str,
+            metavar=('direction','pixels'),
+            help='Outcrop the image with one or more direction/pixel pairs: e.g. -c top 64 bottom 128 left 64 right 64',
+        )
+        outpainting_group.add_argument(
+            '--force_outpaint',
+            action='store_true',
+            default=False,
+            help='Force outpainting if you have no inpainting mask to pass',
+        )
+        outpainting_group.add_argument(
+            '--seam_size',
+            type=int,
+            default=0,
+            help='When outpainting, size of the mask around the seam between original and outpainted image',
+        )
+        outpainting_group.add_argument(
+            '--seam_blur',
+            type=int,
+            default=0,
+            help='When outpainting, the amount to blur the seam inwards',
+        )
+        outpainting_group.add_argument(
+            '--seam_strength',
+            type=float,
+            default=0.7,
+            help='When outpainting, the img2img strength to use when filling the seam. Values around 0.7 work well',
+        )
+        outpainting_group.add_argument(
+            '--seam_steps',
+            type=int,
+            default=10,
+            help='When outpainting, the number of steps to use to fill the seam. Low values (~10) work well',
+        )
+        outpainting_group.add_argument(
+            '--tile_size',
+            type=int,
+            default=32,
+            help='When outpainting, the tile size to use for filling outpaint areas',
         )
         postprocessing_group.add_argument(
             '-ft',
@@ -810,6 +883,20 @@ class Args(object):
             type=str,
             help='list of variations to apply, in the format `seed:weight,seed:weight,...'
         )
+        render_group.add_argument(
+            '--use_mps_noise',
+            action='store_true',
+            dest='use_mps_noise',
+            help='Simulate noise on M1 systems to get the same results'
+        )
+        deprecated_group.add_argument(
+            '-D',
+            '--out_direction',
+            nargs='+',
+            type=str,
+            metavar=('direction', 'pixels'),
+            help='Older outcropping system. Direction to extend the given image (left|right|top|bottom). If a distance pixel value is not specified it defaults to half the image size'
+        )
         return parser
 
 def format_metadata(**kwargs):
@@ -845,9 +932,8 @@ def metadata_dumps(opt,
 
     # remove any image keys not mentioned in RFC #266
     rfc266_img_fields = ['type','postprocessing','sampler','prompt','seed','variations','steps',
-                         'cfg_scale','threshold','perlin','step_number','width','height','extra','strength',
-                         'init_img','init_mask']
-
+                         'cfg_scale','threshold','perlin','fnformat', 'step_number','width','height','extra','strength',
+                         'init_img','init_mask','facetool','facetool_strength','upscale']
     rfc_dict ={}
 
     for item in image_dict.items():
@@ -930,7 +1016,7 @@ def metadata_loads(metadata) -> list:
         for image in images:
             # repack the prompt and variations
             if 'prompt' in image:
-                image['prompt']     = ','.join([':'.join([x['prompt'],   str(x['weight'])]) for x in image['prompt']])
+                image['prompt']     = repack_prompt(image['prompt'])
             if 'variations' in image:
                 image['variations'] = ','.join([':'.join([str(x['seed']),str(x['weight'])]) for x in image['variations']])
             # fix a bit of semantic drift here
@@ -938,11 +1024,18 @@ def metadata_loads(metadata) -> list:
             opt = Args()
             opt._cmd_switches = Namespace(**image)
             results.append(opt)
-    except KeyError as e:
+    except Exception as e:
         import sys, traceback
-        print('>> badly-formatted metadata',file=sys.stderr)
+        print('>> could not read metadata',file=sys.stderr)
         print(traceback.format_exc(), file=sys.stderr)
     return results
+
+def repack_prompt(prompt_list:list)->str:
+    # in the common case of no weighting syntax, just return the prompt as is
+    if len(prompt_list) > 1:
+        return ','.join([':'.join([x['prompt'], str(x['weight'])]) for x in prompt_list])
+    else:
+        return prompt_list[0]['prompt']
 
 # image can either be a file path on disk or a base64-encoded
 # representation of the file's contents
@@ -973,17 +1066,17 @@ def sha256(path):
     return sha.hexdigest()
 
 def legacy_metadata_load(meta,pathname) -> Args:
+    opt = Args()
     if 'Dream' in meta and len(meta['Dream']) > 0:
         dream_prompt = meta['Dream']
-        opt = Args()
         opt.parse_cmd(dream_prompt)
-        return opt
     else:               # if nothing else, we can get the seed
         match = re.search('\d+\.(\d+)',pathname)
         if match:
             seed = match.groups()[0]
-            opt = Args()
             opt.seed = seed
-            return opt
-    return None
+        else:
+            opt.prompt = ''
+            opt.seed = 0
+    return opt
             

@@ -18,6 +18,7 @@ from ldm.invoke.image_util import make_grid
 from ldm.invoke.log import write_log
 from omegaconf import OmegaConf
 from pathlib import Path
+from pyparsing import ParseException
 
 # global used in multiple functions (fix)
 infile = None
@@ -69,16 +70,17 @@ def main():
     # creating a Generate object:
     try:
         gen = Generate(
-            conf           = opt.conf,
-            model          = opt.model,
-            sampler_name   = opt.sampler_name,
+            conf = opt.conf,
+            model = opt.model,
+            sampler_name = opt.sampler_name,
             embedding_path = opt.embedding_path,
             full_precision = opt.full_precision,
-            precision      = opt.precision,
+            precision = opt.precision,
             gfpgan=gfpgan,
             codeformer=codeformer,
             esrgan=esrgan,
             free_gpu_mem=opt.free_gpu_mem,
+            safety_checker=opt.safety_checker,
             )
     except (FileNotFoundError, IOError, KeyError) as e:
         print(f'{e}. Aborting.')
@@ -171,8 +173,7 @@ def main_loop(gen, opt):
                 pass
 
         if len(opt.prompt) == 0:
-            print('\nTry again with a prompt!')
-            continue
+            opt.prompt = ''
 
         # width and height are set by model if not specified
         if not opt.width:
@@ -327,12 +328,16 @@ def main_loop(gen, opt):
             if operation == 'generate':
                 catch_ctrl_c = infile is None # if running interactively, we catch keyboard interrupts
                 opt.last_operation='generate'
-                gen.prompt2image(
-                    image_callback=image_writer,
-                    step_callback=step_callback,
-                    catch_interrupts=catch_ctrl_c,
-                    **vars(opt)
-                )
+                try:
+                    gen.prompt2image(
+                        image_callback=image_writer,
+                        step_callback=step_callback,
+                        catch_interrupts=catch_ctrl_c,
+                        **vars(opt)
+                    )
+                except ParseException as e:
+                    print('** An error occurred while processing your prompt **')
+                    print(f'** {str(e)} **')
             elif operation == 'postprocess':
                 print(f'>> fixing {opt.prompt}')
                 opt.last_operation = do_postprocess(gen,opt,image_writer)
@@ -493,6 +498,16 @@ def add_weights_to_config(model_path:str, gen, opt, completer):
         new_config['config'] = input('Configuration file for this model: ')
         done = os.path.exists(new_config['config'])
 
+    done = False
+    completer.complete_extensions(('.vae.pt','.vae','.ckpt'))
+    while not done:
+        vae = input('VAE autoencoder file for this model [None]: ')
+        if os.path.exists(vae):
+            new_config['vae'] = vae
+            done = True
+        else:
+            done = len(vae)==0
+
     completer.complete_extensions(None)
 
     for field in ('width','height'):
@@ -537,8 +552,8 @@ def edit_config(model_name:str, gen, opt, completer):
 
     conf = config[model_name]
     new_config = {}
-    completer.complete_extensions(('.yaml','.yml','.ckpt','.vae'))
-    for field in ('description', 'weights', 'config', 'width','height'):
+    completer.complete_extensions(('.yaml','.yml','.ckpt','.vae.pt'))
+    for field in ('description', 'weights', 'vae', 'config', 'width','height'):
         completer.linebuffer = str(conf[field]) if field in conf else ''
         new_value = input(f'{field}: ')
         new_config[field] = int(new_value) if field in ('width','height') else new_value
@@ -581,7 +596,9 @@ def write_config_file(conf_path, gen, model_name, new_config, clobber=False, mak
 
 def do_textmask(gen, opt, callback):
     image_path = opt.prompt
-    assert os.path.exists(image_path), '** "{image_path}" not found. Please enter the name of an existing image file to mask **'
+    if not os.path.exists(image_path):
+        image_path = os.path.join(opt.outdir,image_path)
+    assert os.path.exists(image_path), '** "{opt.prompt}" not found. Please enter the name of an existing image file to mask **'
     assert opt.text_mask is not None and len(opt.text_mask) >= 1, '** Please provide a text mask with -tm **'
     tm = opt.text_mask[0]
     threshold = float(opt.text_mask[1]) if len(opt.text_mask) > 1  else 0.5
@@ -636,7 +653,10 @@ def add_postprocessing_to_metadata(opt,original_file,new_file,tool,command):
     original_file = original_file if os.path.exists(original_file) else os.path.join(opt.outdir,original_file)
     new_file       = new_file     if os.path.exists(new_file)      else os.path.join(opt.outdir,new_file)
     meta = retrieve_metadata(original_file)['sd-metadata']
-    img_data = meta['image']
+    if 'image' not in meta:
+        meta = metadata_dumps(opt,seeds=[opt.seed])['image']
+        meta['image'] = {}
+    img_data = meta.get('image')
     pp = img_data.get('postprocessing',[]) or []
     pp.append(
         {
@@ -660,7 +680,17 @@ def prepare_image_metadata(
     if postprocessed and opt.save_original:
         filename = choose_postprocess_name(opt,prefix,seed)
     else:
-        filename = f'{prefix}.{seed}.png'
+        wildcards = dict(opt.__dict__)
+        wildcards['prefix'] = prefix
+        wildcards['seed'] = seed
+        try:
+            filename = opt.fnformat.format(**wildcards)
+        except KeyError as e:
+            print(f'** The filename format contains an unknown key \'{e.args[0]}\'. Will use \'{{prefix}}.{{seed}}.png\' instead')
+            filename = f'{prefix}.{seed}.png'
+        except IndexError as e:
+            print(f'** The filename format is broken or complete. Will use \'{{prefix}}.{{seed}}.png\' instead')
+            filename = f'{prefix}.{seed}.png'
 
     if opt.variation_amount > 0:
         first_seed             = first_seed or seed
@@ -786,26 +816,38 @@ def retrieve_dream_command(opt,command,completer):
     will retrieve and format the dream command used to generate the image,
     and pop it into the readline buffer (linux, Mac), or print out a comment
     for cut-and-paste (windows)
+
     Given a wildcard path to a folder with image png files, 
     will retrieve and format the dream command used to generate the images,
     and save them to a file commands.txt for further processing
     '''
     if len(command) == 0:
         return
+
     tokens = command.split()
-    if len(tokens) > 1:
-        outfilepath = tokens[1]
-    else:
-        outfilepath = "commands.txt"
-        
-    file_path = tokens[0]    
-    dir,basename = os.path.split(file_path)
+    dir,basename = os.path.split(tokens[0])
     if len(dir) == 0:
-        dir = opt.outdir
-        
-    outdir,outname = os.path.split(outfilepath)    
-    if len(outdir) == 0:
-        outfilepath = os.path.join(dir,outname)
+        path = os.path.join(opt.outdir,basename)
+    else:
+        path = tokens[0]
+
+    if len(tokens) > 1:
+        return write_commands(opt, path, tokens[1])
+
+    cmd = ''
+    try:
+        cmd = dream_cmd_from_png(path)
+    except OSError:
+        print(f'## {tokens[0]}: file could not be read')
+    except (KeyError, AttributeError, IndexError):
+        print(f'## {tokens[0]}: file has no metadata')
+    except:
+        print(f'## {tokens[0]}: file could not be processed')
+    if len(cmd)>0:
+        completer.set_line(cmd)
+
+def write_commands(opt, file_path:str, outfilepath:str):
+    dir,basename = os.path.split(file_path)
     try:
         paths = list(Path(dir).glob(basename))
     except ValueError:
@@ -813,28 +855,24 @@ def retrieve_dream_command(opt,command,completer):
         return
  
     commands = []
+    cmd = None
     for path in paths:
         try:
             cmd = dream_cmd_from_png(path)
-        except OSError:
-            print(f'## {path}: file could not be read')
-            continue
         except (KeyError, AttributeError, IndexError):
             print(f'## {path}: file has no metadata')
-            continue
         except:
             print(f'## {path}: file could not be processed')
-            continue
-            
-        commands.append(f'# {path}')
-        commands.append(cmd)
- 
-    with open(outfilepath, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(commands))
-    print(f'>> File {outfilepath} with commands created')
-
-    if len(commands) == 2:
-       completer.set_line(commands[1])
+        if cmd:
+            commands.append(f'# {path}')
+            commands.append(cmd)
+    if len(commands)>0:
+        dir,basename = os.path.split(outfilepath)
+        if len(dir)==0:
+            outfilepath = os.path.join(opt.outdir,basename)
+        with open(outfilepath, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(commands))
+        print(f'>> File {outfilepath} with commands created')
 
 ######################################
 
