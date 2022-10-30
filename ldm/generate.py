@@ -947,7 +947,7 @@ class Generate:
 
     def _create_init_image(self, image: Image.Image, width, height, fit=True):
         if image.mode != 'RGBA':
-            image = image.convert('RGB')
+            image = image.convert('RGBA')
         image = self._fit_image(image, (width, height)) if fit else self._squeeze_image(image)
         return image
 
@@ -965,6 +965,8 @@ class Generate:
         # Obtain the mask from the transparency channel
         if mask_image.mode == 'L':
             mask = mask_image
+        elif mask_image.mode in ('RGB', 'P'):
+            mask = mask_image.convert('L')
         else:
             # Obtain the mask from the transparency channel
             mask = Image.new(mode="L", size=mask_image.size, color=255)

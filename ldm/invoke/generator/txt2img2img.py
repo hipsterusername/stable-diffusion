@@ -25,10 +25,8 @@ class Txt2Img2Img(Generator):
         kwargs are 'width' and 'height'
         """
         uc, c, extra_conditioning_info = conditioning
-
-        trained_square = 512 * 512
-        actual_square = width * height
-        scale = math.sqrt(trained_square / actual_square)
+        scale_dim = min(width, height)
+        scale = 512 / scale_dim
 
         init_width = math.ceil(scale * width / 64) * 64
         init_height = math.ceil(scale * height / 64) * 64
@@ -41,14 +39,14 @@ class Txt2Img2Img(Generator):
                 init_height // self.downsampling_factor,
                 init_width // self.downsampling_factor,
             ]
-            
+
             sampler.make_schedule(
                     ddim_num_steps=steps, ddim_eta=ddim_eta, verbose=False
             )
-            
+
             #x = self.get_noise(init_width, init_height)
             x = x_T
-            
+
             if self.free_gpu_mem and self.model.model.device != self.model.device:
                 self.model.model.to(self.model.device)
 
@@ -65,15 +63,15 @@ class Txt2Img2Img(Generator):
                 img_callback                 = step_callback,
                 extra_conditioning_info      = extra_conditioning_info
             )
-            
+
             print(
                   f"\n>> Interpolating from {init_width}x{init_height} to {width}x{height} using DDIM sampling"
                  )
-            
+
             # resizing
             samples = torch.nn.functional.interpolate(
-                samples, 
-                size=(height // self.downsampling_factor, width // self.downsampling_factor), 
+                samples,
+                size=(height // self.downsampling_factor, width // self.downsampling_factor),
                 mode="bilinear"
             )
 
@@ -162,7 +160,7 @@ class Txt2Img2Img(Generator):
         else:
             scaled_width = width
             scaled_height = height
-            
+
         device      = self.model.device
         if self.use_mps_noise or device.type == 'mps':
             return torch.randn([1,
